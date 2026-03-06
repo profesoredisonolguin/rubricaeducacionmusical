@@ -49,6 +49,7 @@
         #chart-container { border: 1px dashed #ccc; padding: 20px; text-align: center; background: white; min-height: 300px; }
         #saved-evaluations-list div:hover { background-color: #d0e8fd !important; }
     </style>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 <div class="container">
@@ -67,6 +68,12 @@
                 <button id="save-student-data-button">Guardar Cambios</button>
                 <button id="reset-student-data-button">Restablecer a Original</button>
             </div>
+        </div>
+
+        <div style="text-align: right; padding: 5px 0 10px 0;">
+            <button id="drive-save-button" style="padding: 5px 10px; font-size: 13px; cursor: pointer; background-color: transparent; color: #888; border: 1px solid #ccc; border-radius: 4px; margin-right: 6px;">☁ Guardar en Drive</button>
+            <button id="drive-load-button" style="padding: 5px 10px; font-size: 13px; cursor: pointer; background-color: transparent; color: #888; border: 1px solid #ccc; border-radius: 4px;">☁ Cargar desde Drive</button>
+            <div id="drive-status" style="margin-top: 5px; font-size: 12px; color: #888;"></div>
         </div>
 
         <div id="descriptor-selection-container" class="rubrica-section">
@@ -111,6 +118,7 @@
             <button id="export-button" style="padding: 10px 20px; font-size: 16px; cursor: pointer; background-color: #28a745; color: white; border: none; border-radius: 5px; margin-right: 10px;">⬇ Exportar datos (.json)</button>
             <label for="import-input" style="padding: 10px 20px; font-size: 16px; cursor: pointer; background-color: #6c757d; color: white; border: none; border-radius: 5px; display: inline-block;">⬆ Importar datos (.json)</label>
             <input type="file" id="import-input" accept=".json" style="display: none;">
+
         </div>
 
         <div id="analysis-results-container" style="margin-top: 20px;"></div>
@@ -742,6 +750,134 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         return svg;
     }
+
+    // --- Google Drive ---
+    const DRIVE_CLIENT_ID = '644973578837-vse1u0e7u1c4m6j6pj849phspnlv7t4f.apps.googleusercontent.com';
+    const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
+    const DRIVE_FOLDER_NAME = 'Rúbrica Educación Musical';
+    const driveStatus = document.getElementById('drive-status');
+
+    function driveSetStatus(msg, color = '#555') {
+        driveStatus.style.color = color;
+        driveStatus.textContent = msg;
+    }
+
+    function driveAuthenticate() {
+        return new Promise((resolve, reject) => {
+            const client = google.accounts.oauth2.initTokenClient({
+                client_id: DRIVE_CLIENT_ID,
+                scope: DRIVE_SCOPES,
+                callback: (response) => {
+                    if (response.error) { reject(response.error); return; }
+                    resolve(response.access_token);
+                }
+            });
+            client.requestAccessToken();
+        });
+    }
+
+    async function driveGetOrCreateFolder(token) {
+        const searchRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id,name)`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const searchData = await searchRes.json();
+        if (searchData.files && searchData.files.length > 0) return searchData.files[0].id;
+        const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: DRIVE_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' })
+        });
+        const createData = await createRes.json();
+        return createData.id;
+    }
+
+    async function driveSaveFile(token, folderId, fileName, content) {
+        const searchRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${folderId}' in parents and trashed=false&fields=files(id,name)`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const searchData = await searchRes.json();
+        const blob = new Blob([content], { type: 'application/json' });
+        if (searchData.files && searchData.files.length > 0) {
+            const fileId = searchData.files[0].id;
+            await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+                method: 'PATCH',
+                headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: blob
+            });
+            return 'actualizado';
+        } else {
+            const metadata = { name: fileName, parents: [folderId] };
+            const form = new FormData();
+            form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+            form.append('file', blob);
+            await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+                body: form
+            });
+            return 'creado';
+        }
+    }
+
+    async function driveLoadFile(token, folderId, fileName) {
+        const searchRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${folderId}' in parents and trashed=false&fields=files(id,name)`,
+            { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const searchData = await searchRes.json();
+        if (!searchData.files || searchData.files.length === 0) return null;
+        const fileId = searchData.files[0].id;
+        const fileRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+        return await fileRes.json();
+    }
+
+    document.getElementById('drive-save-button').addEventListener('click', async () => {
+        const allEvaluations = JSON.parse(localStorage.getItem('allEvaluations')) || [];
+        if (allEvaluations.length === 0) { alert('No hay evaluaciones para guardar.'); return; }
+        driveSetStatus('Autenticando con Google...');
+        try {
+            const token = await driveAuthenticate();
+            driveSetStatus('Buscando carpeta en Drive...');
+            const folderId = await driveGetOrCreateFolder(token);
+            const cursoActual = courseCodeToName(`${courseSelect.value.replace('°', '')}${letterSelect.value}`);
+            const fileName = `rubrica_${cursoActual}.json`;
+            driveSetStatus('Guardando archivo...');
+            const result = await driveSaveFile(token, folderId, fileName, JSON.stringify(allEvaluations, null, 2));
+            driveSetStatus(`✅ Archivo "${fileName}" ${result} correctamente en Drive.`, '#28a745');
+        } catch (err) {
+            driveSetStatus(`❌ Error: ${err}`, '#dc3545');
+        }
+    });
+
+    document.getElementById('drive-load-button').addEventListener('click', async () => {
+        driveSetStatus('Autenticando con Google...');
+        try {
+            const token = await driveAuthenticate();
+            driveSetStatus('Buscando carpeta en Drive...');
+            const folderId = await driveGetOrCreateFolder(token);
+            const cursoActual = courseCodeToName(`${courseSelect.value.replace('°', '')}${letterSelect.value}`);
+            const fileName = `rubrica_${cursoActual}.json`;
+            driveSetStatus(`Buscando "${fileName}" en Drive...`);
+            const data = await driveLoadFile(token, folderId, fileName);
+            if (!data) {
+                driveSetStatus(`⚠️ No se encontró "${fileName}" en Drive.`, '#e0a800');
+                return;
+            }
+            const existing = JSON.parse(localStorage.getItem('allEvaluations')) || [];
+            const existingIds = new Set(existing.map(e => e.id));
+            const newEntries = data.filter(e => !existingIds.has(e.id));
+            const merged = [...existing, ...newEntries];
+            localStorage.setItem('allEvaluations', JSON.stringify(merged));
+            displaySavedEvaluations();
+            driveSetStatus(`✅ Se cargaron ${newEntries.length} evaluación(es) nueva(s) desde Drive.`, '#28a745');
+        } catch (err) {
+            driveSetStatus(`❌ Error: ${err}`, '#dc3545');
+        }
+    });
 
     displaySavedEvaluations();
 });
